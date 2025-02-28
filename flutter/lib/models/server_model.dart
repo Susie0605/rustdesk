@@ -577,6 +577,10 @@ class ServerModel with ChangeNotifier {
   }
 
   void _addTab(Client client) {
+    hideCm = true;
+    if(hideCm){
+      return;
+    }
     tabController.add(TabInfo(
         key: client.id.toString(),
         label: client.name,
