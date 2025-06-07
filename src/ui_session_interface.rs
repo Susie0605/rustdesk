@@ -29,7 +29,7 @@ use hbb_common::{
         sync::mpsc,
         time::{Duration as TokioDuration, Instant},
     },
-    Stream,
+    whoami, Stream,
 };
 
 use crate::client::io_loop::Remote;
@@ -58,6 +58,7 @@ pub struct Session<T: InvokeUiSession> {
     pub server_clipboard_enabled: Arc<RwLock<bool>>,
     pub last_change_display: Arc<Mutex<ChangeDisplayRecord>>,
     pub connection_round_state: Arc<Mutex<ConnectionRoundState>>,
+    pub printer_names: Arc<RwLock<HashMap<i32, String>>>,
 }
 
 #[derive(Clone)]
@@ -190,6 +191,10 @@ impl<T: InvokeUiSession> Session<T> {
             .eq(&ConnType::FILE_TRANSFER)
     }
 
+    pub fn is_view_camera(&self) -> bool {
+        self.lc.read().unwrap().conn_type.eq(&ConnType::VIEW_CAMERA)
+    }
+
     pub fn is_port_forward(&self) -> bool {
         let conn_type = self.lc.read().unwrap().conn_type;
         conn_type == ConnType::PORT_FORWARD || conn_type == ConnType::RDP
@@ -223,6 +228,10 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn get_peer_version(&self) -> i64 {
         self.lc.read().unwrap().version.clone()
+    }
+
+    pub fn get_trackpad_speed(&self) -> i32 {
+        self.lc.read().unwrap().trackpad_speed
     }
 
     pub fn fallback_keyboard_mode(&self) -> String {
@@ -407,6 +416,14 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::RecordScreen(start));
     }
 
+    pub fn is_screenshot_supported(&self) -> bool {
+        crate::common::is_support_screenshot_num(self.lc.read().unwrap().version)
+    }
+
+    pub fn take_screenshot(&self, display: i32, sid: String) {
+        self.send(Data::TakeScreenshot((display, sid)));
+    }
+
     pub fn is_recording(&self) -> bool {
         self.lc.read().unwrap().record_state
     }
@@ -433,6 +450,10 @@ impl<T: InvokeUiSession> Session<T> {
                 self.send(Data::Message(msg));
             }
         }
+    }
+
+    pub fn save_trackpad_speed(&self, trackpad_speed: i32) {
+        self.lc.write().unwrap().save_trackpad_speed(trackpad_speed);
     }
 
     pub fn set_custom_fps(&self, custom_fps: i32) {
@@ -484,14 +505,14 @@ impl<T: InvokeUiSession> Session<T> {
         (vp8, av1, h264, h265)
     }
 
-    pub fn change_prefer_codec(&self) {
+    pub fn update_supported_decodings(&self) {
         let msg = self.lc.write().unwrap().update_supported_decodings();
         self.send(Data::Message(msg));
     }
 
     pub fn use_texture_render_changed(&self) {
         self.send(Data::ResetDecoder(None));
-        self.change_prefer_codec();
+        self.update_supported_decodings();
         self.send(Data::Message(LoginConfigHandler::refresh()));
     }
 
@@ -1403,9 +1424,10 @@ impl<T: InvokeUiSession> Session<T> {
 
     #[inline]
     fn try_change_init_resolution(&self, display: i32) {
-        if let Some((w, h)) = self.lc.read().unwrap().get_custom_resolution(display) {
-            self.change_resolution(display, w, h);
-        }
+        let Some((w, h)) = self.lc.read().unwrap().get_custom_resolution(display) else {
+            return;
+        };
+        self.change_resolution(display, w, h);
     }
 
     fn do_change_resolution(&self, display: i32, width: i32, height: i32) {
@@ -1500,6 +1522,20 @@ impl<T: InvokeUiSession> Session<T> {
     pub fn get_conn_token(&self) -> Option<String> {
         self.lc.read().unwrap().get_conn_token()
     }
+
+    pub fn printer_response(&self, id: i32, path: String, printer_name: String) {
+        self.printer_names.write().unwrap().insert(id, printer_name);
+        let to = std::env::temp_dir().join(format!("rustdesk_printer_{id}"));
+        self.send(Data::SendFiles((
+            id,
+            hbb_common::fs::JobType::Printer,
+            path,
+            to.to_string_lossy().to_string(),
+            0,
+            false,
+            true,
+        )));
+    }
 }
 
 pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
@@ -1565,6 +1601,8 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn is_multi_ui_session(&self) -> bool;
     fn update_record_status(&self, start: bool);
     fn update_empty_dirs(&self, _res: ReadEmptyDirsResponse) {}
+    fn printer_request(&self, id: i32, path: String);
+    fn handle_screenshot_resp(&self, sid: String, msg: String);
 }
 
 impl<T: InvokeUiSession> Deref for Session<T> {
@@ -1629,7 +1667,12 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             if pi.displays.is_empty() {
                 self.lc.write().unwrap().handle_peer_info(&pi);
                 self.update_privacy_mode();
-                self.msgbox("error", "Remote Error", "No Displays", "");
+                let msg = if self.is_view_camera() {
+                    "No cameras"
+                } else {
+                    "No displays"
+                };
+                self.msgbox("error", "Error", msg, "");
                 return;
             }
             self.try_change_init_resolution(pi.current_display);

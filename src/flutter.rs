@@ -544,17 +544,45 @@ impl FlutterHandler {
     where
         V: Sized + Serialize + Clone,
     {
+        self.push_event_(name, event, &[], excludes);
+    }
+
+    pub fn push_event_to<V>(&self, name: &str, event: &[(&str, V)], include: &[&SessionID])
+    where
+        V: Sized + Serialize + Clone,
+    {
+        self.push_event_(name, event, include, &[]);
+    }
+
+    pub fn push_event_<V>(
+        &self,
+        name: &str,
+        event: &[(&str, V)],
+        includes: &[&SessionID],
+        excludes: &[&SessionID],
+    ) where
+        V: Sized + Serialize + Clone,
+    {
         let mut h: HashMap<&str, serde_json::Value> =
             event.iter().map(|(k, v)| (*k, json!(*v))).collect();
         debug_assert!(h.get("name").is_none());
         h.insert("name", json!(name));
         let out = serde_json::ser::to_string(&h).unwrap_or("".to_owned());
         for (sid, session) in self.session_handlers.read().unwrap().iter() {
-            if excludes.contains(&sid) {
-                continue;
+            let mut push = false;
+            if includes.is_empty() {
+                if !excludes.contains(&sid) {
+                    push = true;
+                }
+            } else {
+                if includes.contains(&sid) {
+                    push = true;
+                }
             }
-            if let Some(stream) = &session.event_stream {
-                stream.add(EventToUI::Event(out.clone()));
+            if push {
+                if let Some(stream) = &session.event_stream {
+                    stream.add(EventToUI::Event(out.clone()));
+                }
             }
         }
     }
@@ -1059,6 +1087,24 @@ impl InvokeUiSession for FlutterHandler {
     fn update_record_status(&self, start: bool) {
         self.push_event("record_status", &[("start", &start.to_string())], &[]);
     }
+
+    fn printer_request(&self, id: i32, path: String) {
+        self.push_event(
+            "printer_request",
+            &[("id", json!(id)), ("path", json!(path))],
+            &[],
+        );
+    }
+
+    fn handle_screenshot_resp(&self, sid: String, msg: String) {
+        match SessionID::from_str(&sid) {
+            Ok(sid) => self.push_event_to("screenshot", &[("msg", json!(msg))], &[&sid]),
+            Err(e) => {
+                // Unreachable!
+                log::error!("Failed to parse sid \"{}\", {}", sid, e);
+            }
+        }
+    }
 }
 
 impl FlutterHandler {
@@ -1149,8 +1195,14 @@ pub fn session_add_existed(
     peer_id: String,
     session_id: SessionID,
     displays: Vec<i32>,
+    is_view_camera: bool,
 ) -> ResultType<()> {
-    sessions::insert_peer_session_id(peer_id, ConnType::DEFAULT_CONN, session_id, displays);
+    let conn_type = if is_view_camera {
+        ConnType::VIEW_CAMERA
+    } else {
+        ConnType::DEFAULT_CONN
+    };
+    sessions::insert_peer_session_id(peer_id, conn_type, session_id, displays);
     Ok(())
 }
 
@@ -1160,11 +1212,13 @@ pub fn session_add_existed(
 ///
 /// * `id` - The identifier of the remote session with prefix. Regex: [\w]*[\_]*[\d]+
 /// * `is_file_transfer` - If the session is used for file transfer.
+/// * `is_view_camera` - If the session is used for view camera.
 /// * `is_port_forward` - If the session is used for port forward.
 pub fn session_add(
     session_id: &SessionID,
     id: &str,
     is_file_transfer: bool,
+    is_view_camera: bool,
     is_port_forward: bool,
     is_rdp: bool,
     switch_uuid: &str,
@@ -1175,6 +1229,8 @@ pub fn session_add(
 ) -> ResultType<FlutterSession> {
     let conn_type = if is_file_transfer {
         ConnType::FILE_TRANSFER
+    } else if is_view_camera {
+        ConnType::VIEW_CAMERA
     } else if is_port_forward {
         if is_rdp {
             ConnType::RDP
@@ -1978,7 +2034,10 @@ pub mod sessions {
                 None => {}
             }
         }
-        SESSIONS.write().unwrap().remove(&remove_peer_key?)
+        let s = SESSIONS.write().unwrap().remove(&remove_peer_key?);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        update_session_count_to_server();
+        s
     }
 
     fn check_remove_unused_displays(
@@ -2026,6 +2085,8 @@ pub mod sessions {
                     // This operation will also cause the peer to send a switch display message.
                     // The switch display message will contain `SupportedResolutions`, which is useful when changing resolutions.
                     s.switch_display(value[0]);
+                    // Reset the valid flag of the display.
+                    s.next_rgba(value[0] as usize);
 
                     if !is_desktop {
                         s.capture_displays(vec![], vec![], value);
@@ -2078,6 +2139,14 @@ pub mod sessions {
             .write()
             .unwrap()
             .insert(session_id, Default::default());
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        update_session_count_to_server();
+    }
+
+    #[inline]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn update_session_count_to_server() {
+        crate::ipc::update_controlling_session_count(SESSIONS.read().unwrap().len()).ok();
     }
 
     #[inline]
@@ -2103,6 +2172,11 @@ pub mod sessions {
                 .write()
                 .unwrap()
                 .insert(session_id, h);
+            // If the session is a single display session, it may be a software rgba rendered display.
+            // If this is the second time the display is opened, the old valid flag may be true.
+            if displays.len() == 1 {
+                s.ui_handler.next_rgba(displays[0] as usize);
+            }
             true
         } else {
             false
